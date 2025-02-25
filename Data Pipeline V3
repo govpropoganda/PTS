@@ -1,0 +1,154 @@
+import pandas as pd
+import numpy as np
+import requests
+import time
+import os
+import sys
+import logging
+from ib_insync import IB, Stock, Future
+from concurrent.futures import ThreadPoolExecutor
+from numba import njit
+
+# Configure logging to record events and errors
+logging.basicConfig(filename='data_pipeline.log', level=logging.INFO, 
+                    format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Interactive Brokers Connection Settings
+IB_HOST = '127.0.0.1'
+IB_PORT = 7497
+IB_CLIENT_ID = 1
+
+# EIA API Key (stored in environment variable for security)
+EIA_API_KEY = os.getenv('EIA_API_KEY', 'YOUR_EIA_API_KEY')
+
+# Initialize the Interactive Brokers connection
+ib = IB()
+try:
+    ib.connect(IB_HOST, IB_PORT, clientId=IB_CLIENT_ID)
+    logging.info("Connected to Interactive Brokers.")
+except Exception as e:
+    logging.error(f"Failed to connect to IBKR: {e}")
+    sys.exit(1)
+
+# List of stock symbols to track
+symbols = ["COP", "XOM", "SHEL", "USO", "LIN", "CVX", "WMB", "AEP", "PSX"]
+# List of futures symbols to track (e.g., crude oil futures)
+futures_symbols = ["CL"]
+
+# Additional Macroeconomic Data Sources
+FOREX_SYMBOL = "DXY"
+INTEREST_RATE_API = "https://api.stlouisfed.org/fred/series/observations?series_id=FEDFUNDS&api_key=YOUR_FRED_API_KEY&file_type=json"
+
+
+def fetch_stock_data(symbol):
+    """Fetches stock price and volume data from IBKR."""
+    try:
+        contract = Stock(symbol, "SMART", "USD")
+        ib.qualifyContracts(contract)
+        bars = ib.reqHistoricalData(contract, durationStr='1 D', barSizeSetting='1 min',
+                                    whatToShow='TRADES', useRTH=True)
+        df = pd.DataFrame([{**bar.__dict__} for bar in bars])
+        if df.empty:
+            logging.warning(f"No data found for {symbol}")
+            return None
+        df.set_index('date', inplace=True)
+        df.rename(columns={'close': 'Close', 'volume': 'Volume'}, inplace=True)
+        return df
+    except Exception as e:
+        logging.error(f"Error fetching stock data for {symbol}: {e}")
+        return None
+
+
+def fetch_futures_data(symbol):
+    """Fetches futures data from IBKR."""
+    try:
+        contract = Future(symbol, "NYMEX")
+        ib.qualifyContracts(contract)
+        bars = ib.reqHistoricalData(contract, durationStr='1 D', barSizeSetting='1 min',
+                                    whatToShow='TRADES', useRTH=True)
+        df = pd.DataFrame([{**bar.__dict__} for bar in bars])
+        if df.empty:
+            logging.warning(f"No data found for {symbol}")
+            return None
+        df.set_index('date', inplace=True)
+        df.rename(columns={'close': 'Close', 'volume': 'Volume'}, inplace=True)
+        return df
+    except Exception as e:
+        logging.error(f"Error fetching futures data for {symbol}: {e}")
+        return None
+
+
+def fetch_eia_forecast():
+    """Fetches short-term energy outlook data from the EIA API."""
+    url = f"https://api.eia.gov/v2/steo/data/?api_key={EIA_API_KEY}&frequency=monthly"
+    try:
+        response = requests.get(url, timeout=10)
+        if response.status_code == 200:
+            return response.json()
+        else:
+            logging.error(f"Failed to fetch EIA data. Status code: {response.status_code}")
+            return None
+    except requests.RequestException as e:
+        logging.error(f"EIA request failed: {e}")
+        return None
+
+
+def fetch_forex_data():
+    """Fetches USD strength (DXY) data."""
+    try:
+        contract = Future(FOREX_SYMBOL, "NYMEX")
+        ib.qualifyContracts(contract)
+        bars = ib.reqHistoricalData(contract, durationStr='1 D', barSizeSetting='1 min',
+                                    whatToShow='MIDPOINT', useRTH=True)
+        df = pd.DataFrame([{**bar.__dict__} for bar in bars])
+        if df.empty:
+            logging.warning(f"No data found for {FOREX_SYMBOL}")
+            return None
+        df.set_index('date', inplace=True)
+        df.rename(columns={'close': 'Close'}, inplace=True)
+        return df
+    except Exception as e:
+        logging.error(f"Error fetching forex data for {FOREX_SYMBOL}: {e}")
+        return None
+
+
+def fetch_interest_rates():
+    """Fetches interest rate data from the FRED API."""
+    try:
+        response = requests.get(INTEREST_RATE_API, timeout=10)
+        if response.status_code == 200:
+            return response.json()
+        else:
+            logging.error(f"Failed to fetch interest rate data. Status code: {response.status_code}")
+            return None
+    except requests.RequestException as e:
+        logging.error(f"Interest rate request failed: {e}")
+        return None
+
+
+def main():
+    """Main pipeline function to gather and process market data."""
+    os.makedirs("data", exist_ok=True)
+    all_data = {}
+
+    with ThreadPoolExecutor() as executor:
+        stock_results = executor.map(fetch_stock_data, symbols)
+        futures_results = executor.map(fetch_futures_data, futures_symbols)
+        forex_result = executor.submit(fetch_forex_data)
+        interest_rates_result = executor.submit(fetch_interest_rates)
+    
+    for symbol, df in zip(symbols, stock_results):
+        all_data[symbol] = df
+    
+    for symbol, df in zip(futures_symbols, futures_results):
+        all_data[symbol] = df
+    
+    all_data[FOREX_SYMBOL] = forex_result.result()
+    all_data["InterestRates"] = interest_rates_result.result()
+
+    eia_data = fetch_eia_forecast()
+    if eia_data:
+        logging.info("Fetched EIA energy forecast data.")
+
+if __name__ == '__main__':
+    main()
