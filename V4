@@ -1,0 +1,156 @@
+import pandas as pd
+import numpy as np
+import requests
+import os
+import sys
+import logging
+import asyncio
+import sqlite3
+import yaml
+import contextlib
+from ib_insync import IB, Stock, Future, Forex
+from dotenv import load_dotenv
+from time import sleep
+
+# Load environment variables
+load_dotenv()
+
+# Configure logging to record events and errors
+logging.basicConfig(filename='data_pipeline.log', level=logging.DEBUG, 
+                    format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Load configuration from YAML
+with open('config.yaml', 'r') as file:
+    config = yaml.safe_load(file)
+
+# Interactive Brokers Connection Settings
+IB_HOST = config.get('ib_settings', {}).get('host', 'localhost')
+IB_PORT = config.get('ib_settings', {}).get('port', 7497)
+IB_CLIENT_ID = config.get('ib_settings', {}).get('client_id', 1)
+
+# API Keys (stored in .env for security)
+EIA_API_KEY = os.getenv('EIA_API_KEY')
+FRED_API_KEY = os.getenv('FRED_API_KEY')
+
+# Initialize SQLite database
+conn = sqlite3.connect("market_data.db")
+cursor = conn.cursor()
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS market_data (
+        symbol TEXT,
+        date TEXT,
+        close REAL,
+        volume INTEGER
+    )
+""")
+conn.commit()
+
+# Initialize Interactive Brokers connection
+ib = IB()
+def connect_ib():
+    for attempt in range(3):  # Retry up to 3 times
+        try:
+            ib.connect(IB_HOST, IB_PORT, clientId=IB_CLIENT_ID)
+            logging.info("Connected to Interactive Brokers.")
+            return
+        except Exception as e:
+            logging.error(f"Attempt {attempt + 1}: Failed to connect to IBKR: {e}")
+            sleep(5)
+    sys.exit("Failed to connect to IBKR after multiple attempts.")
+
+connect_ib()
+
+# Symbols to track
+symbols = config.get('stocks', [])
+futures_symbols = config.get('futures', [])
+FOREX_SYMBOL = "DXY"
+INTEREST_RATE_API = f"https://api.stlouisfed.org/fred/series/observations?series_id=FEDFUNDS&api_key={FRED_API_KEY}&file_type=json"
+
+def fetch_with_retry(url, max_retries=3, timeout=10):
+    """Fetch data from API with retry logic."""
+    for attempt in range(max_retries):
+        try:
+            response = requests.get(url, timeout=timeout)
+            response.raise_for_status()
+            return response.json()
+        except requests.RequestException as e:
+            logging.error(f"Attempt {attempt + 1}: API request failed - {e}")
+            sleep(3)
+    return None
+
+async def fetch_data(contract_type, symbol, what_to_show='TRADES', duration='1 D', bar_size='1 min'):
+    """Fetches stock, futures, or forex data from IBKR."""
+    try:
+        if contract_type == Stock:
+            contract = Stock(symbol, "SMART", "USD")
+        elif contract_type == Future:
+            details = ib.reqContractDetails(Future(symbol, exchange="NYMEX"))
+            if not details:
+                logging.warning(f"No contract details found for {symbol}")
+                return None
+            contract = details[0].contract  # Use first available future contract
+        elif contract_type == Forex:
+            contract = Forex(symbol)
+
+        ib.qualifyContracts(contract)
+        bars = ib.reqHistoricalData(contract, durationStr=duration, barSizeSetting=bar_size,
+                                    whatToShow=what_to_show, useRTH=False)
+        if not bars:
+            logging.warning(f"No data found for {symbol}")
+            return None
+
+        df = pd.DataFrame([{**bar.__dict__} for bar in bars])
+        df.set_index('date', inplace=True)
+        df.rename(columns={'close': 'Close', 'volume': 'Volume'}, inplace=True)
+        df.dropna(inplace=True)  # Data cleaning
+
+        with contextlib.closing(conn):
+            cursor.executemany("INSERT INTO market_data (symbol, date, close, volume) VALUES (?, ?, ?, ?)",
+                               [(symbol, index, row['Close'], row['Volume']) for index, row in df.iterrows()])
+            conn.commit()
+
+        return df
+    except Exception as e:
+        logging.error(f"Error fetching data for {symbol}: {e}")
+        return None
+
+async def fetch_eia_forecast():
+    """Fetches short-term energy outlook data from the EIA API."""
+    if not EIA_API_KEY:
+        logging.error("EIA API key not found. Skipping EIA data fetch.")
+        return None
+    return fetch_with_retry(f"https://api.eia.gov/v2/steo/data/?api_key={EIA_API_KEY}&frequency=monthly")
+
+async def fetch_interest_rates():
+    """Fetches interest rate data from the FRED API."""
+    if not FRED_API_KEY:
+        logging.error("FRED API key not found. Skipping interest rate data fetch.")
+        return None
+    return fetch_with_retry(INTEREST_RATE_API)
+
+async def main():
+    """Main pipeline function to gather and process market data."""
+    all_data = {}
+    tasks = []
+    
+    try:
+        for symbol in symbols:
+            tasks.append(fetch_data(Stock, symbol, duration='1 W', bar_size='5 min'))
+        for symbol in futures_symbols:
+            tasks.append(fetch_data(Future, symbol, duration='1 W', bar_size='5 min'))
+        tasks.append(fetch_data(Forex, FOREX_SYMBOL, what_to_show='MIDPOINT', duration='1 W', bar_size='5 min'))
+        tasks.append(fetch_interest_rates())
+        tasks.append(fetch_eia_forecast())
+        
+        results = await asyncio.gather(*tasks)
+        
+        all_data = {symbol: df for symbol, df in zip(symbols + futures_symbols + [FOREX_SYMBOL, "InterestRates", "EIA_Forecast"], results)}
+    except Exception as e:
+        logging.exception(f"An error occurred in the main pipeline: {e}")
+    finally:
+        ib.disconnect()
+        conn.close()
+        logging.info("Disconnected from Interactive Brokers and closed database connection.")
+
+if __name__ == '__main__':
+    asyncio.run(main())
